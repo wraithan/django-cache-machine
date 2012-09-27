@@ -8,3 +8,4 @@ python-memcached
 fabric
 jinja2
 redis
+elasticutils

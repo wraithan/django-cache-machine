@@ -1,6 +1,7 @@
 import collections
 import functools
 import hashlib
+import json
 import logging
 import socket
 
@@ -12,6 +13,17 @@ try:
     import redis as redislib
 except ImportError:
     redislib = None
+
+try:
+    import requests
+    import elasticutils
+except ImportError:
+    elasticutils = None
+
+try:
+    import pyes
+except ImportError:
+    pyes = None
 
 
 CACHE_PREFIX = getattr(settings, 'CACHE_PREFIX', '')
@@ -63,6 +75,27 @@ def safe_redis(return_type):
         return wrapper
     return decorator
 
+
+def safe_es(return_type):
+    """
+    Decorator to catch and log any elastic search errors.
+
+    return_type (optionally a callable) will be returned if there is an error.
+    """
+    def decorator(f):
+        @functools.wraps(f)
+        def wrapper(*args, **kw):
+            try:
+                return f(*args, **kw)
+            except pyes.exceptions.ElasticSearchException, e:
+                log.error('es error: %s' % e)
+                # log.error('%r\n%r : %r' % (f.__name__, args[1:], kw))
+                if hasattr(return_type, '__call__'):
+                    return return_type()
+                else:
+                    return return_type
+        return wrapper
+    return decorator
 
 
 class Invalidator(object):
@@ -169,6 +202,85 @@ class RedisInvalidator(Invalidator):
         redis.delete(*map(self.safe_key, keys))
 
 
+class ElasticSearchInvalidator(Invalidator):
+    index = 'cache-machine'
+    doc_type = 'invalidator'
+    endpoint = 'localhost:9200'
+
+    def __init__(self, endpoint):
+        super(ElasticSearchInvalidator, self).__init__()
+        self.endpoint = endpoint or self.endpoint
+
+    def safe_key(self, key):
+        return hashlib.sha1(key)
+
+    def build_url(self, key):
+        return '%(endpoint)s/%(index)s/%(type)s/%(key)s' % {
+            'endpoint': self.endpoint,
+            'index': self.index,
+            'type': self.doc_type,
+            'key': key}
+
+    @safe_es(None)
+    def add_to_flush_list(self, mapping):
+        """Update flush lists with the {flush_key: [query_key,...]} map."""
+        log.debug('add_to_flush_lists')
+        for key, list_ in mapping.items():
+            for query_key in list_:
+                res = requests.get(self.build_url(key))
+                log.debug('add_to_flush_list: %s' % res.content)
+                obj = json.loads(res.content)
+                if 'exists' in obj and obj['exists']:
+                    log.debug('add_to_flush_list: %s already exists' % key)
+                    url = self.build_url(key) + '/_update'
+                    data = {
+                        'script': ('ctx._source.query_key += query_key'),
+                        'params': {
+                            'query_key': query_key
+                        }
+                    }
+                    status = requests.post(url, json.dumps(data))
+                    log.debug('add_to_flush_list: data: %s, response: %s' % (
+                        data,
+                        status.content))
+                else:
+                    log.debug('add_to_flush_list: %s does not already exist'
+                              % key)
+                    doc = {'key': key, 'query_key': [query_key]}
+                    status = es.index(doc=doc, index=self.index,
+                                      doc_type=self.doc_type,
+                                      id=key)
+                    log.debug('add_to_flush_list: %s' % status)
+
+    @safe_es(set)
+    def get_flush_lists(self, keys):
+        log.debug('get_flush_lists')
+        if not keys:
+            return set()
+        rv = []
+        for key in keys:
+            res = requests.get(self.build_url(key))
+            log.debug('get_flush_lists: looked up %s and got %s' %
+                      (key,
+                       res.content))
+            obj = json.loads(res.content)
+            if '_source' in obj:
+                rv += obj['_source']['query_key']
+        rv = set(rv)
+        log.debug('get_flush_lists: looked up %s and got %s' % (keys, rv))
+        return rv
+
+    @safe_es(None)
+    def clear_flush_lists(self, keys):
+        log.debug('clear_flush_lists')
+        for key in keys:
+            es.delete(self.index, self.doc_type, key)
+
+    def flushall(self):
+        es.delete_index_if_exists(self.index)
+        es.create_index(self.index)
+
+
 class NullInvalidator(Invalidator):
 
     def add_to_flush_list(self, mapping):
@@ -202,10 +314,40 @@ def get_redis_backend():
                           socket_timeout=socket_timeout)
 
 
+def get_es_backend():
+    class CurlDumper(object):
+        def __init__(self, logger):
+            self.logger = logger
+
+        def write(self, s):
+            self.logger.debug('CurlDumper: %s' % s.strip())
+    es_hosts = getattr(settings, 'ES_HOSTS', ['localhost:9200'])
+    requests_endpoint = 'http://%s' % es_hosts[0]
+    mapping = {
+        'invalidator': {
+            '_source': {
+                'enabled': True
+            },
+            'properties': {
+                'query_key': {
+                    'type': 'list',
+                }
+            },
+        }
+    }
+    requests.put(requests_endpoint + '/cache-machine/invalidator/_mapping',
+                 data=mapping)
+    return (elasticutils.get_es(hosts=es_hosts,
+                               dump_curl=CurlDumper(logger=log)),
+            requests_endpoint)
+
 if getattr(settings, 'CACHE_MACHINE_NO_INVALIDATION', False):
     invalidator = NullInvalidator()
 elif getattr(settings, 'CACHE_MACHINE_USE_REDIS', False):
     redis = get_redis_backend()
     invalidator = RedisInvalidator()
+elif getattr(settings, 'CACHE_MACHINE_USE_ELASTIC_SEARCH', False):
+    es, endpoint = get_es_backend()
+    invalidator = ElasticSearchInvalidator(endpoint)
 else:
     invalidator = Invalidator()

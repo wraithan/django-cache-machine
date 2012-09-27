@@ -37,11 +37,24 @@ try:
 except Exception:
     print 'WARNING: Skipping redis tests.'
 
+try:
+    import elasticutils
+    elasticutils.get_es().status()
+    SETTINGS += ('es_settings', 'es_byid')
+except Exception:
+    print 'WARNING: Skipping elasticsearch tests.'
+
+
 def test():
     for settings in SETTINGS:
         print settings
         os.environ['DJANGO_SETTINGS_MODULE'] = 'cache-machine.%s' % settings
         local('django-admin.py test')
+
+
+def test_es():
+    os.environ['DJANGO_SETTINGS_MODULE'] = 'cache-machine.es_settings'
+    local('django-admin.py test --failfast')
 
 
 def updoc():

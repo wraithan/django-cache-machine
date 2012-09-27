@@ -23,6 +23,8 @@ class CachingTestCase(ExtraAppTestCase):
         self.old_timeout = getattr(settings, 'CACHE_COUNT_TIMEOUT', None)
         if getattr(settings, 'CACHE_MACHINE_USE_REDIS', False):
             invalidation.redis.flushall()
+        if getattr(settings, 'CACHE_MACHINE_USE_ELASTIC_SEARCH', False):
+            invalidation.invalidator.flushall()
 
     def tearDown(self):
         settings.CACHE_COUNT_TIMEOUT = self.old_timeout
@@ -435,6 +437,7 @@ class CachingTestCase(ExtraAppTestCase):
 
     @mock.patch('caching.invalidation.cache.get_many')
     def test_get_flush_lists_none(self, cache_mock):
-        if not getattr(settings, 'CACHE_MACHINE_USE_REDIS', False):
+        if not (getattr(settings, 'CACHE_MACHINE_USE_REDIS', False) or
+                getattr(settings, 'CACHE_MACHINE_USE_ELASTIC_SEARCH', False)):
             cache_mock.return_value.values.return_value = [None, [1]]
             eq_(caching.invalidator.get_flush_lists(None), set([1]))
